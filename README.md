@@ -9,6 +9,8 @@ although it's only 8 bit resolution at 24 samples per second.
 I'm not sure how accurate this signal is, but it looks plausible and sometimes even shows a little bump that seems 
 to be the dicrotic notch signal from the aortic valve closure.
 
-To use it with your own device you would need to change the DEVICE_ADDRESS to match your particular unit.
+The **pulse_waveform_viewer.py** was tested on a Windows laptop.
+To use these programs with your own device you would need to change the DEVICE_ADDRESS to match your particular unit.
 This is an unofficial program and I have no connection with the INNOVO company other than having bought a few of their units.
 
+![Pulse Graph](InnovoPulseGraph.PNG)
