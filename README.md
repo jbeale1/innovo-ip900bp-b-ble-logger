@@ -1,18 +1,17 @@
-The **innovo_pi_logger.py** connects to my INNOVO iP900BP-B "finger pulse oximeter" over Bluetooth (BLE protocol = Bluetooth Low Energy) 
-and records the data stream it generates. It was tested on a Raspberry Pi 3, and should work on 
+The **innovo_pi_logger.py** connects to an INNOVO iP900BP-B "finger pulse oximeter" over Bluetooth (BLE protocol = Bluetooth Low Energy) and records the data stream it generates. It was tested on a Raspberry Pi 3, and should work on 
 any other machine that has Bluetooth capability and the python libraries.
 
 It records SpO2, Pulse, Respiration Rate, and Perfusion Index (PI%) once per second to a CSV file.
-Note the respiration rate (estimated from HR timing variation) is quite unreliable. 
-The SpO2 and Pulse values seem reasonable though. The Bluetooth data also includes the raw plethysmograph signal, 
-although it's only 8 bit resolution at 24 samples per second. This is recorded in a separate CSV file.
+I found the reported respiration rate (estimated from HR timing variation) to be unreliable, by comparison to more direct methods like a respiratory belt. Extracting that rate is sensitive to even small motion artifacts.
+Assuming there is little or no hand or arm motion, the SpO2 and Pulse values seem reasonable. The Bluetooth data also includes the raw plethysmograph signal, 
+although it's only 8 bit resolution at 24 samples per second. The logger records this in a separate CSV file.
 I'm not sure how accurate the pleth signal is, but it looks plausible and sometimes even shows a little bump that seems 
 to be the dicrotic notch signal from the aortic valve closure.
 
 Below output is from a Windows laptop running **pulse_waveform_viewer.py**
 ![Pulse Graph](InnovoPulseGraph.PNG)
 
-Below output is from a headless Pi logging the data. You can also run this program with the **--rssi** option 
+Below text is from a headless Pi logging the data. You can also run this program with the **--rssi** option 
 to just show and log the signal strength of the device without actually connecting and getting the SpO2, pulse etc. data. It will record the current and minimum-observed signal so you can walk around your house to see how far away you can get and still get reception. In my case, it still works two rooms away.
 ```
 pi@rp4:~/Documents/sleep $ ./innovo_pi_logger.py
