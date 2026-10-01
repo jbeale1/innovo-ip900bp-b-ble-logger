@@ -12,15 +12,46 @@ import argparse
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 
-VERSION = "2.3"
+VERSION = "2.4.1"
 
-DEVICE_ADDRESS = "D3:67:B7:93:27:00"
+DEVICE_NAME = "iP900BPB"  # Name of the Innovo device to look for in BLE advertisements
 
 # Generate filename with start time: YYYYMMDD_HHMMSS_pulse.csv
 def get_csv_filename():
     now = datetime.now()
     timestamp = now.strftime('%Y%m%d_%H%M%S')
     return os.path.expanduser(f"~/{timestamp}_pulse.csv")
+
+
+async def find_innovo_device(timeout=5.0):
+    """
+    Scan for Innovo iP900BPB devices and return the address with strongest signal.
+    If multiple devices found, returns the one with strongest RSSI (highest value).
+    Returns the device address or None if not found.
+    """
+    devices_found = {}
+
+    def detection_callback(device, advertisement_data):
+        """Called when a device is discovered"""
+        if device.name and DEVICE_NAME in device.name:
+            devices_found[device.address] = advertisement_data.rssi
+
+    try:
+        async with BleakScanner(detection_callback) as scanner:
+            await asyncio.sleep(timeout)
+    except Exception as e:
+        print(f"Error during device scan: {e}")
+        return None
+
+    if not devices_found:
+        return None
+
+    # Return address with strongest RSSI (highest value = least negative = strongest)
+    strongest_address = max(devices_found, key=devices_found.get)
+    strongest_rssi = devices_found[strongest_address]
+    print(f"Found {DEVICE_NAME} at {strongest_address} (RSSI: {strongest_rssi} dBm)")
+    return strongest_address
+
 
 class OximeterLogger:
     """Logs oximeter readings to CSV and displays them"""
@@ -309,7 +340,7 @@ async def scan_rssi_only():
 
     def detection_callback(device, advertisement_data):
         """Called when a BLE advertisement is detected"""
-        if device.address.upper() == DEVICE_ADDRESS.upper():
+        if device.name and DEVICE_NAME in device.name:
             rssi = advertisement_data.rssi
             logger.add_rssi_sample(rssi)
 
@@ -343,6 +374,14 @@ async def scan_rssi_only():
 async def main():
     """Connect and stream live measurements"""
 
+    # Find the Innovo device
+    print("Scanning for Innovo devices...")
+    device_address = await find_innovo_device(timeout=5.0)
+
+    if not device_address:
+        print(f"Error: Could not find {DEVICE_NAME} device. Make sure it's powered on and in range.")
+        return 1
+
     csv_filename = get_csv_filename()
     # Generate waveform CSV filename (same timestamp as summary)
     timestamp = csv_filename.split('/')[-1].split('_pulse')[0]
@@ -351,8 +390,8 @@ async def main():
     logger = None
 
     try:
-        print(f"Connecting to {DEVICE_ADDRESS}...")
-        async with BleakClient(DEVICE_ADDRESS) as client:
+        print(f"Connecting to {device_address}...")
+        async with BleakClient(device_address) as client:
             logger = OximeterLogger(csv_filename, waveform_csv_filename, client=client)
             print(f"Connected!")
             print("Discovering characteristics...")
