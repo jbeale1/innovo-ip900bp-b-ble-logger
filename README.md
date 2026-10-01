@@ -13,14 +13,11 @@ The **pulse_waveform_viewer.py** was tested on a Windows laptop.
 To use these programs with your own device you would need to change the DEVICE_ADDRESS to match your particular unit.
 This is an unofficial program and I have no connection with the INNOVO company other than having bought a few of their units.
 
-![Pulse Graph](InnovoPulseGraph.PNG)
-
-'''
+```
 pi@rp4:~/Documents/sleep $ ./innovo_pi_logger.py
 ================================================================================
 Innovo iP900BP-B BLE Logger (Raspberry Pi) v2.4
 ================================================================================
-
 Scanning for Innovo devices...
 Found iP900BPB at ED:9B:47:2E:0F:68 (RSSI: -65 dBm)
 Connecting to ED:9B:47:2E:0F:68...
@@ -29,17 +26,14 @@ Waveform CSV initialized: /home/pi/20260930_230330_pulse_waveform.csv
 Connected!
 Discovering characteristics...
 Found 4 notify characteristic(s)
-
 ================================================================================
 Live Measurements (put finger on oximeter, press Ctrl+C to stop)
 ================================================================================
-
 [  28] SpO2:  97% | Pulse:  72 BPM | Respiration:  9/min | PI:  8.0% | Bad:   3     ^C
-
 Stopping...
-
-
 Logged 28 summary measurements to /home/pi/20260930_230330_pulse.csv
 Bad frames (all zeros): 3
 Logged 684 waveform samples to /home/pi/20260930_230330_pulse_waveform.csv
-'''
+```
+
+![Pulse Graph](InnovoPulseGraph.PNG)
