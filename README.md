@@ -10,9 +10,13 @@ I'm not sure how accurate this signal is, but it looks plausible and sometimes e
 to be the dicrotic notch signal from the aortic valve closure.
 
 The **pulse_waveform_viewer.py** was tested on a Windows laptop.
-To use these programs with your own device you would need to change the DEVICE_ADDRESS to match your particular unit.
+These programs search for a device named "iP900BPB" and if multiple exist, uses the one with the best signal strength.
 This is an unofficial program and I have no connection with the INNOVO company other than having bought a few of their units.
+Below output is from a Windows laptop running pulse_waveform_viewer.
+![Pulse Graph](InnovoPulseGraph.PNG)
 
+Below output is from a headless Pi logging the data. You can also run this program with the **--rssi** option 
+to just show and log the signal strength of the device without actually getting the pulse data from it. It will record the current and minimum-observed signal so you can walk around your house to see how far away you can get and still get reception. In my case, it still works two rooms away.
 ```
 pi@rp4:~/Documents/sleep $ ./innovo_pi_logger.py
 ================================================================================
@@ -35,5 +39,3 @@ Logged 28 summary measurements to /home/pi/20260930_230330_pulse.csv
 Bad frames (all zeros): 3
 Logged 684 waveform samples to /home/pi/20260930_230330_pulse_waveform.csv
 ```
-
-![Pulse Graph](InnovoPulseGraph.PNG)
