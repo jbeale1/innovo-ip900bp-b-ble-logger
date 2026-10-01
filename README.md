@@ -1,4 +1,4 @@
-This innovo_pi_logger.py connects to my INNOVO iP900BP-B "finger pulse oximeter" over Bluetooth (BLE protocol = Bluetooth Low Energy) 
+This **innovo_pi_logger.py** connects to my INNOVO iP900BP-B "finger pulse oximeter" over Bluetooth (BLE protocol = Bluetooth Low Energy) 
 and records the data stream it generates. It was tested on a Raspberry Pi 3, and I would guess should work on 
 any other machine as well that has Bluetooth capability and the python libraries.
 
