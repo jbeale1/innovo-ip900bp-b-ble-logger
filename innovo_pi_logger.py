@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
 Innovo iP900BP-B BLE Logger for Raspberry Pi
-Based on the working Windows Bleak code, with CSV logging
+Uses Bleak library, with CSV file logging of 1 sps and 24 sps data streams
+J.Beale 1-Oct-2026
 """
 
 import asyncio
 import csv
 import os
 import sys
+import time
 import argparse
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 
-VERSION = "2.4.1"
+VERSION = "2.7"
 
-DEVICE_NAME = "iP900BPB"  # Name of the Innovo device to look for in BLE advertisements
+DEVICE_NAME = "iP900BPB"
 
 # Generate filename with start time: YYYYMMDD_HHMMSS_pulse.csv
 def get_csv_filename():
@@ -23,10 +25,11 @@ def get_csv_filename():
     return os.path.expanduser(f"~/{timestamp}_pulse.csv")
 
 
-async def find_innovo_device(timeout=5.0):
+async def find_innovo_device(timeout=5.0, target_address=None):
     """
     Scan for Innovo iP900BPB devices and return the address with strongest signal.
-    If multiple devices found, returns the one with strongest RSSI (highest value).
+    If target_address is specified, only return that specific address if found.
+    If multiple devices found (and no target_address), returns the one with strongest RSSI.
     Returns the device address or None if not found.
     """
     devices_found = {}
@@ -45,6 +48,15 @@ async def find_innovo_device(timeout=5.0):
 
     if not devices_found:
         return None
+
+    # If looking for a specific target address, return it if found
+    if target_address:
+        if target_address in devices_found:
+            rssi = devices_found[target_address]
+            print(f"Found {DEVICE_NAME} at {target_address} (RSSI: {rssi} dBm)")
+            return target_address
+        else:
+            return None
 
     # Return address with strongest RSSI (highest value = least negative = strongest)
     strongest_address = max(devices_found, key=devices_found.get)
@@ -71,6 +83,7 @@ class OximeterLogger:
         self.packet_count = 0
         self.waveform_sample_count = 0
         self.missing_frames = 0
+        self.signal_acquired = False  # Track if we've received first valid reading
 
         self.init_csv()
 
@@ -102,8 +115,12 @@ class OximeterLogger:
             self.perfusion_index = data_bytes[11] / 10.0
             self.packet_count += 1
 
-            # Check for all-zero frame (signal dropout or finger removed)
-            if self.spo2 == 0 and self.pulse == 0 and self.respiration == 0 and self.perfusion_index == 0:
+            # Mark that we've received a valid signal (first non-zero reading)
+            if not self.signal_acquired and (self.spo2 > 0 or self.pulse > 0 or self.respiration > 0 or self.perfusion_index > 0):
+                self.signal_acquired = True
+
+            # Check for all-zero frame (signal dropout or finger removed) - only after initial signal acquired
+            if self.signal_acquired and self.spo2 == 0 and self.pulse == 0 and self.respiration == 0 and self.perfusion_index == 0:
                 self.missing_frames += 1
 
             # Write summary to CSV with one decimal place of second precision
@@ -372,79 +389,128 @@ async def scan_rssi_only():
 
 
 async def main():
-    """Connect and stream live measurements"""
+    """Connect and stream live measurements with auto-reconnect on BLE loss"""
 
-    # Find the Innovo device
-    print("Scanning for Innovo devices...")
-    device_address = await find_innovo_device(timeout=5.0)
+    original_device_address = None
+    scanning_printed = False  # Track if we've printed the scanning message for this reconnection
+    exit_requested = False  # Track if user pressed Ctrl+C
 
-    if not device_address:
-        print(f"Error: Could not find {DEVICE_NAME} device. Make sure it's powered on and in range.")
-        return 1
+    while True:  # Outer reconnection loop
+        # Exit if user pressed Ctrl+C
+        if exit_requested:
+            break
 
-    csv_filename = get_csv_filename()
-    # Generate waveform CSV filename (same timestamp as summary)
-    timestamp = csv_filename.split('/')[-1].split('_pulse')[0]
-    waveform_csv_filename = os.path.expanduser(f"~/{timestamp}_pulse_waveform.csv")
+        try:
+            # Find the Innovo device
+            if original_device_address:
+                if not scanning_printed:
+                    print(f"\nScanning for original device {original_device_address}...")
+                    scanning_printed = True
+                device_address = await find_innovo_device(timeout=5.0, target_address=original_device_address)
+                if not device_address:
+                    await asyncio.sleep(2.0)
+                    continue
+            else:
+                print("Scanning for Innovo devices...")
+                device_address = await find_innovo_device(timeout=5.0)
+                if not device_address:
+                    print(f"Error: Could not find {DEVICE_NAME} device. Make sure it's powered on and in range.")
+                    return 1
 
-    logger = None
+            # Remember the original address for reconnection
+            if not original_device_address:
+                original_device_address = device_address
 
-    try:
-        print(f"Connecting to {device_address}...")
-        async with BleakClient(device_address) as client:
-            logger = OximeterLogger(csv_filename, waveform_csv_filename, client=client)
-            print(f"Connected!")
-            print("Discovering characteristics...")
+            # Create new CSV files with current timestamp
+            csv_filename = get_csv_filename()
+            # Generate waveform CSV filename (same timestamp as summary)
+            timestamp = csv_filename.split('/')[-1].split('_pulse')[0]
+            waveform_csv_filename = os.path.expanduser(f"~/{timestamp}_pulse_waveform.csv")
 
-            # Find all notify/indicate characteristics (same as Windows version)
+            logger = None
+            last_data_time = time.time()
             notify_chars = []
-            for service in client.services:
-                for char in service.characteristics:
-                    if "notify" in char.properties or "indicate" in char.properties:
-                        notify_chars.append(str(char.uuid))
 
-            print(f"Found {len(notify_chars)} notify characteristic(s)")
-
-            # Create notification handler
-            def notification_handler(sender, data):
-                logger.update(bytes(data))
-
-            # Subscribe to all (same as Windows version - no manual CCCD writes)
-            for uuid in notify_chars:
-                try:
-                    await client.start_notify(uuid, notification_handler)
-                except Exception as e:
-                    pass
-
-            print("\n" + "="*80)
-            print("Live Measurements (put finger on oximeter, press Ctrl+C to stop)")
-            print("="*80 + "\n")
-
-            # Keep running until interrupted
             try:
-                while True:
-                    await asyncio.sleep(0.1)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                print("\n\nStopping...")
-                for uuid in notify_chars:
+                print(f"Connecting to {device_address}...")
+                async with BleakClient(device_address, timeout=10.0) as client:
+                    logger = OximeterLogger(csv_filename, waveform_csv_filename, client=client)
+                    print(f"Connected!")
+                    print("Discovering characteristics...")
+
+                    # Find all notify/indicate characteristics
+                    for service in client.services:
+                        for char in service.characteristics:
+                            if "notify" in char.properties or "indicate" in char.properties:
+                                notify_chars.append(str(char.uuid))
+
+                    print(f"Found {len(notify_chars)} notify characteristic(s)")
+
+                    # Create notification handler with timeout tracking
+                    def notification_handler(sender, data):
+                        nonlocal last_data_time
+                        last_data_time = time.time()  # Update last data timestamp
+                        logger.update(bytes(data))
+
+                    # Subscribe to all notify characteristics
+                    for uuid in notify_chars:
+                        try:
+                            await client.start_notify(uuid, notification_handler)
+                        except Exception as e:
+                            pass
+
+                    print("\n" + "="*80)
+                    print("Live Measurements (put finger on oximeter, press Ctrl+C to stop)")
+                    print("="*80 + "\n")
+
+                    # Monitor for data and connection loss
                     try:
-                        await client.stop_notify(uuid)
-                    except:
-                        pass
+                        while True:
+                            await asyncio.sleep(1)  # Check every second for data loss
 
-    except (KeyboardInterrupt, EOFError, BrokenPipeError):
-        # Graceful exit on Ctrl+C or dbus disconnect errors
-        pass
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+                            # Check if no data received for 10 seconds
+                            if time.time() - last_data_time > 10.0:
+                                print(f"\n\nNo data received for 10 seconds - BLE connection lost")
+                                break
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        print("\n\nStopping...")
+                        exit_requested = True
+                        # Don't re-raise - let context manager exit cleanly
 
-    finally:
-        if logger:
-            logger.close()
+                    # Cleanup notifications (always runs)
+                    for uuid in notify_chars:
+                        try:
+                            await client.stop_notify(uuid)
+                        except:
+                            pass
 
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Ctrl+C during connection setup
+                exit_requested = True
+            except Exception as e:
+                print(f"Connection error: {e}")
+                import traceback
+                traceback.print_exc()
+
+            finally:
+                if logger:
+                    logger.close()
+
+            # Wait before attempting reconnection (silent)
+            await asyncio.sleep(2.0)
+            # Reset flag so scanning message prints again if needed
+            scanning_printed = False
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl+C during reconnection scan
+            exit_requested = True
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(2.0)
+
+    print("\n\nProgram terminated.")
     return 0
 
 
