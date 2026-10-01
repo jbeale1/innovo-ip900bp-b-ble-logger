@@ -9,13 +9,45 @@ import csv
 import sys
 from datetime import datetime
 from collections import deque
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
 from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel
 from PyQt5.QtCore import QTimer, pyqtSignal, QThread, Qt
 from PyQt5.QtGui import QFont
 
-DEVICE_ADDRESS = "D3:67:B7:93:27:00"
+VERSION = "2.4"
+DEVICE_NAME = "iP900BPB"
+
+
+async def find_innovo_device(timeout=5.0):
+    """
+    Scan for Innovo iP900BPB devices and return the address with strongest signal.
+    If multiple devices found, returns the one with strongest RSSI (highest value).
+    Returns the device address or None if not found.
+    """
+    devices_found = {}
+
+    def detection_callback(device, advertisement_data):
+        """Called when a device is discovered"""
+        if device.name and DEVICE_NAME in device.name:
+            devices_found[device.address] = advertisement_data.rssi
+
+    try:
+        async with BleakScanner(detection_callback) as scanner:
+            await asyncio.sleep(timeout)
+    except Exception as e:
+        print(f"Error during device scan: {e}")
+        return None
+
+    if not devices_found:
+        return None
+
+    # Return address with strongest RSSI (highest value = least negative = strongest)
+    strongest_address = max(devices_found, key=devices_found.get)
+    strongest_rssi = devices_found[strongest_address]
+    print(f"Found {DEVICE_NAME} at {strongest_address} (RSSI: {strongest_rssi} dBm)")
+    return strongest_address
+
 
 class BLEThread(QThread):
     """Runs BLE connection in a separate thread"""
@@ -26,6 +58,11 @@ class BLEThread(QThread):
     def __init__(self):
         super().__init__()
         self.running = True
+        self.device_address = None
+
+    def set_device_address(self, address):
+        """Set the device address before starting the connection"""
+        self.device_address = address
 
     def run(self):
         """Run the BLE event loop"""
@@ -33,6 +70,11 @@ class BLEThread(QThread):
 
     async def connect_and_stream(self):
         """Connect to device and stream data with retry logic"""
+        if not self.device_address:
+            self.connection_status.emit("Error: No device address set")
+            print("Error: No device address set")
+            return
+
         max_retries = 5
         retry_delay = 2
 
@@ -41,9 +83,9 @@ class BLEThread(QThread):
                 self.connection_status.emit(f"Connecting (attempt {attempt + 1}/{max_retries})...")
                 print(f"Connection attempt {attempt + 1}/{max_retries}...")
 
-                async with BleakClient(DEVICE_ADDRESS, timeout=10.0) as client:
+                async with BleakClient(self.device_address, timeout=10.0) as client:
                     self.connection_status.emit("Connected")
-                    print(f"Connected to {DEVICE_ADDRESS}")
+                    print(f"Connected to {self.device_address}")
 
                     # Find notify characteristics
                     notify_chars = []
@@ -119,7 +161,7 @@ class OximeterViewer(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Innovo Pulse Waveform Viewer")
+        self.setWindowTitle(f"Innovo Pulse Waveform Viewer v{VERSION} - Searching for device...")
         self.setGeometry(100, 100, 1200, 650)
 
         # Data storage
@@ -146,17 +188,43 @@ class OximeterViewer(QMainWindow):
         # Setup UI
         self.setup_ui()
 
-        # Start BLE thread
-        self.ble_thread = BLEThread()
-        self.ble_thread.waveform_data.connect(self.on_waveform_data)
-        self.ble_thread.summary_data.connect(self.on_summary_data)
-        self.ble_thread.connection_status.connect(self.on_connection_status)
-        self.ble_thread.start()
+        # BLE thread (will be started after device discovery)
+        self.ble_thread = None
 
         # Update plot timer
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_plot)
         self.update_timer.start(50)  # Update 20 times per second
+
+        # Start device discovery in a background thread
+        self.discovery_thread = QThread()
+        self.discovery_thread.run = self.find_and_connect_device
+        self.discovery_thread.start()
+
+    def find_and_connect_device(self):
+        """Find Innovo device and start BLE connection"""
+        try:
+            # Run device discovery
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            device_address = loop.run_until_complete(find_innovo_device(timeout=5.0))
+            loop.close()
+
+            if device_address:
+                print(f"Device discovered: {device_address}")
+                # Start BLE thread with discovered address
+                self.ble_thread = BLEThread()
+                self.ble_thread.set_device_address(device_address)
+                self.ble_thread.waveform_data.connect(self.on_waveform_data)
+                self.ble_thread.summary_data.connect(self.on_summary_data)
+                self.ble_thread.connection_status.connect(self.on_connection_status)
+                self.ble_thread.start()
+            else:
+                self.setWindowTitle(f"Innovo Pulse Waveform Viewer v{VERSION} - No device found")
+                print("No Innovo device found")
+        except Exception as e:
+            print(f"Error during device discovery: {e}")
+            self.setWindowTitle(f"Innovo Pulse Waveform Viewer v{VERSION} - Error: {e}")
 
     def init_csv(self):
         """Initialize CSV file for waveform logging"""
@@ -233,7 +301,7 @@ class OximeterViewer(QMainWindow):
 
     def on_connection_status(self, status):
         """Handle connection status changes"""
-        self.setWindowTitle(f"Innovo Pulse Waveform Viewer - {status}")
+        self.setWindowTitle(f"Innovo Pulse Waveform Viewer v{VERSION} - {status}")
 
     def update_plot(self):
         """Update the plot display"""
@@ -277,8 +345,9 @@ class OximeterViewer(QMainWindow):
 
         # Stop timers and threads
         self.update_timer.stop()
-        self.ble_thread.stop()
-        self.ble_thread.wait()
+        if self.ble_thread:
+            self.ble_thread.stop()
+            self.ble_thread.wait()
 
         # Close CSV file
         if self.csv_file:
