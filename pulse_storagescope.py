@@ -2,13 +2,15 @@
 """
 Pulse extraction based on local minima detection and min-to-min pulse separation.
 Each pulse is rescaled so its minimum is 0 and maximum is 254.
-Trigger point is where the rising edge crosses 128 in the rescaled data.
-Displays fixed 6-sample pre-trigger, 24-sample post-trigger window (left-shifted by 4).
+Pulse start point is the minimum value of each pulse, aligned at sample index 4 (t=0).
+Displays fixed 6-sample pre-start, 24-sample post-start window for analysis.
 Sample rate: 24 sps. BPM range: 50-180 → pulse length: 8-29 samples.
-Viterbi maximum-likelihood waveform overlay with intensity-driven path finding.
+Median trace extraction: selects the actual pulse closest to per-sample median across all pulses.
+Supports chunking by time duration for long recordings.
+Time axis: sample 4 = t=0 sec (pulse start); range -0.17 to +1.08 seconds.
 """
 
-VERSION = "2.13"
+VERSION = "2.16"
 
 import pandas as pd
 import numpy as np
@@ -17,6 +19,58 @@ from matplotlib.colors import PowerNorm
 from scipy import signal
 from scipy import ndimage
 import sys
+import os
+import re
+from datetime import datetime, timedelta
+
+
+def parse_datetime_from_filename(csv_filename):
+    """
+    Parse start datetime from filename like '20261004_002237_pulse_waveform.csv'.
+
+    Args:
+        csv_filename: filename (basename only, or full path)
+
+    Returns:
+        datetime object or None if pattern not found
+    """
+    basename = os.path.basename(csv_filename)
+    # Pattern: YYYYMMDD_HHMMSS
+    match = re.match(r'(\d{8})_(\d{6})', basename)
+    if match:
+        date_str = match.group(1)  # YYYYMMDD
+        time_str = match.group(2)  # HHMMSS
+
+        year = int(date_str[:4])
+        month = int(date_str[4:6])
+        day = int(date_str[6:8])
+        hour = int(time_str[:2])
+        minute = int(time_str[2:4])
+        second = int(time_str[4:6])
+
+        return datetime(year, month, day, hour, minute, second)
+    return None
+
+
+def generate_chunk_output_filenames(csv_file, chunk_start_time, png_file=None):
+    """
+    Generate output filenames with chunk start time appended.
+
+    Args:
+        csv_file: input CSV file path
+        chunk_start_time: datetime object for chunk start
+        png_file: optional output PNG file path
+
+    Returns:
+        (csv_output, png_output): output file paths with chunk time
+    """
+    base = csv_file.rsplit('.', 1)[0]  # Remove .csv extension
+    time_str = chunk_start_time.strftime('%H%M')  # HHMM format
+
+    csv_output = f"{base}_{time_str}_fit.csv"
+    png_output = f"{base}_{time_str}.png"
+
+    return csv_output, png_output
 
 
 def load_pulse_data(csv_file):
@@ -37,24 +91,24 @@ def find_local_minima(data, order=1):
     return minima_indices
 
 
-def extract_pulses_minmax(waveform, window_before=10, window_after=20,
+def extract_pulses_minmax(waveform, window_before=4, window_after=26,
                           min_samples=8, max_samples=29):
     """
     Extract pulses between consecutive minima.
     Rescale each pulse so min=0, max=254.
-    Find trigger point where rising edge crosses 128.
+    Pulse start point is the minimum value, aligned at sample index 4 (t=0 seconds).
 
     Args:
         waveform: raw waveform data
-        window_before: samples to capture before trigger (10)
-        window_after: samples to capture after trigger (20)
+        window_before: samples to capture before pulse start (4, puts minimum at index 4)
+        window_after: samples to capture after pulse start (26, gives 31 total samples)
         min_samples: minimum pulse length in samples (8 for 180 bpm at 24 sps)
         max_samples: maximum pulse length in samples (29 for 50 bpm at 24 sps)
 
     Returns:
         pulses: array of extracted pulses (each rescaled to 0-254 range)
-        trigger_indices: trigger point within each extracted pulse
-        pulse_info: list of dicts with metadata (original min/max, trigger position)
+        pulse_start_indices: pulse start point (minimum) within each extracted pulse
+        pulse_info: list of dicts with metadata (original min/max, pulse length)
     """
     # Smooth the data
     smoothed = smooth_5point_mean(waveform)
@@ -67,7 +121,7 @@ def extract_pulses_minmax(waveform, window_before=10, window_after=20,
         return np.array([]), np.array([]), []
 
     pulses = []
-    trigger_indices = []
+    pulse_start_indices = []
     pulse_info = []
     discarded_count = 0
 
@@ -97,28 +151,15 @@ def extract_pulses_minmax(waveform, window_before=10, window_after=20,
         # Rescale pulse: min → 0, max → 254
         pulse_rescaled = (pulse - pulse_min) / (pulse_max - pulse_min) * 254.0
 
-        # Find trigger point: where rising edge crosses 128
-        # The rising edge is the early part of the pulse (after the minimum)
-        trigger_idx = None
+        # Find the minimum point (pulse start) in the rescaled pulse
+        pulse_start_idx = np.argmin(pulse_rescaled)
 
-        # Search for the first crossing of 128 on the rising edge
-        for j in range(len(pulse_rescaled) - 1):
-            if pulse_rescaled[j] <= 128 < pulse_rescaled[j + 1]:
-                # Rising edge crossing detected
-                trigger_idx = j
-                break
+        # Map back to original waveform coordinate
+        pulse_start_in_waveform = start_idx + pulse_start_idx
 
-        # If no rising edge crossing found, discard
-        if trigger_idx is None:
-            discarded_count += 1
-            continue
-
-        # Extract fixed window around trigger: window_before samples before, window_after after
-        # The trigger_idx is within the pulse; we need to map it back to the original waveform
-        trigger_in_waveform = start_idx + trigger_idx
-
-        window_start = trigger_in_waveform - window_before
-        window_end = trigger_in_waveform + window_after + 1
+        # Extract fixed window around pulse start: window_before before, window_after after
+        window_start = pulse_start_in_waveform - window_before
+        window_end = pulse_start_in_waveform + window_after + 1
 
         # Check if window is valid
         if window_start < 0 or window_end > len(waveform):
@@ -131,23 +172,22 @@ def extract_pulses_minmax(waveform, window_before=10, window_after=20,
         # Rescale this window the same way (using the pulse's min/max)
         window_rescaled = (window - pulse_min) / (pulse_max - pulse_min) * 254.0
 
-        # Trigger point is at window_before in the extracted window
-        trigger_in_window = window_before
+        # Pulse start point is at window_before in the extracted window
+        pulse_start_in_window = window_before
 
         pulses.append(window_rescaled)
-        trigger_indices.append(trigger_in_window)
+        pulse_start_indices.append(pulse_start_in_window)
 
         pulse_info.append({
             'original_min': float(pulse_min),
             'original_max': float(pulse_max),
-            'pulse_length': pulse_length,
-            'trigger_idx': trigger_idx
+            'pulse_length': pulse_length
         })
 
     print(f"Extracted {len(pulses)} valid pulses")
-    print(f"Discarded {discarded_count} pulses (length out of range or no valid trigger)")
+    print(f"Discarded {discarded_count} pulses (length out of range or invalid window)")
 
-    return np.array(pulses), np.array(trigger_indices), pulse_info
+    return np.array(pulses), np.array(pulse_start_indices), pulse_info
 
 
 def bresenham_line(x0, y0, x1, y1):
@@ -597,43 +637,83 @@ def find_viterbi_ml_waveform_fine(bitmap, x_scale, anchor_column, anchor_value, 
 
 def write_ml_path_csv(ml_path, x_scale, output_file):
     """
-    Write the ML path to a CSV file with sample time resolution.
+    Write the median trace to a CSV file with time resolution.
+    Time is calculated as: t = (sample_idx - 4) / 24 seconds, where sample 4 = t=0 (pulse start).
 
     Args:
-        ml_path: dict {column_idx: value} from Viterbi algorithm
+        ml_path: dict {column_idx: value} from median trace extraction
         x_scale: horizontal scaling factor (to convert columns back to samples)
         output_file: path to output CSV file
     """
     # Convert bitmap columns to sample positions and sort
     columns = sorted(ml_path.keys())
     sample_positions = [c / x_scale for c in columns]
+    # Convert samples to time: t = (sample - 4) / 24 seconds
+    time_positions = [(s - 4) / 24 for s in sample_positions]
     values = [ml_path[c] for c in columns]
 
     # Write CSV with header
     with open(output_file, 'w') as f:
         f.write('time,value\n')
-        for sample, value in zip(sample_positions, values):
-            f.write(f'{sample:.2f},{value:.2f}\n')
+        for time, value in zip(time_positions, values):
+            f.write(f'{time:.3f},{value:.2f}\n')
 
-    print(f"ML path written to {output_file}")
+    print(f"Median trace written to {output_file}")
 
 
-def plot_rasterized(pulses, trigger_indices, value_min=0, value_max=254,
+def find_median_trace(pulses):
+    """
+    Find the median trace by selecting the actual pulse closest to the per-sample median.
+
+    Args:
+        pulses: array of pulse waveforms (n_pulses × n_samples)
+
+    Returns:
+        (median_pulse, selected_pulse_idx): the pulse from the dataset closest to the
+                                            per-sample median values, and its index
+    """
+    # Compute per-sample median across all pulses
+    median_trace = np.median(pulses, axis=0)
+
+    # For each pulse, compute the total Euclidean distance from the median trace
+    distances = []
+    for pulse in pulses:
+        # Sum of squared distances at each sample point (Euclidean metric)
+        euclidean_distance = np.sqrt(np.sum((pulse - median_trace) ** 2))
+        distances.append(euclidean_distance)
+
+    # Select the pulse closest to the median trace
+    closest_pulse_idx = np.argmin(distances)
+    median_pulse = pulses[closest_pulse_idx]
+
+    print(f"Selected pulse {closest_pulse_idx} as median trace (distance: {distances[closest_pulse_idx]:.2f})")
+    print(f"Median trace values: min={np.min(median_trace):.1f}, max={np.max(median_trace):.1f}")
+
+    return median_pulse, closest_pulse_idx
+
+
+def plot_rasterized(pulses, pulse_start_indices, csv_filename=None, value_min=0, value_max=254,
                     x_scale=4, y_scale=2):
-    """Display rasterized waveforms as intensity map."""
+    """Display rasterized waveforms as intensity map with time axis (sample 4 = t=0 sec)."""
     fig, ax = plt.subplots(figsize=(14, 8))
 
     # Draw rasterized oscilloscope display
-    bitmap = draw_rasterized_oscilloscope(pulses, trigger_indices, value_min, value_max,
+    bitmap = draw_rasterized_oscilloscope(pulses, pulse_start_indices, value_min, value_max,
                                           x_scale, y_scale)
 
-    # Display bitmap with intensity mapping using power law scaling
-    cmap = plt.cm.hot.copy()
+    # Display bitmap with greyscale intensity mapping (15% to 75% grey)
+    cmap = plt.cm.gray.copy()
     cmap.set_under('black')
 
     n_samples = pulses.shape[1]
+    # Convert sample indices to time (sample 4 = t=0 seconds, sample rate = 24 sps)
+    # Time for each sample: t = (sample_idx - 4) / 24
+    time_min = (0 - 4) / 24  # -0.167 seconds
+    time_max = (n_samples - 1 - 4) / 24  # 1.083 seconds
+
+    # Map intensity range to greyscale: 0.15 (15% grey) to 0.75 (75% grey)
     im = ax.imshow(bitmap[::-1, :], aspect='auto', cmap=cmap,
-                   extent=[0, n_samples-1, value_min, value_max],
+                   extent=[time_min, time_max, value_min, value_max],
                    origin='lower', interpolation='nearest',
                    norm=PowerNorm(gamma=0.25, vmin=0.5, vmax=bitmap.max()))
 
@@ -642,43 +722,49 @@ def plot_rasterized(pulses, trigger_indices, value_min=0, value_max=254,
     anchor_column, anchor_value = find_trigger_anchor_fine(bitmap, x_scale, trigger_value=128,
                                                            value_min=value_min, value_max=value_max)
 
-    # Add trigger marker at the detected rising edge
+    # Convert anchor to sample position (for informational purposes)
     anchor_sample = anchor_column / x_scale
 
     # Debug: print anchor point info
-    print(f"Anchor detected at column {anchor_column} (sample {anchor_sample:.2f}), value {anchor_value:.1f}")
+    print(f"Peak detected at sample {anchor_sample:.2f}, value {anchor_value:.1f}")
 
-    ax.axvline(x=anchor_sample, color='lime', linestyle='--', linewidth=1.5,
-               label='Rising edge trigger', alpha=0.8)
+    # Draw vertical line at pulse start (sample 4 = t=0 seconds)
+    pulse_start_sample = 4
+    pulse_start_time = (pulse_start_sample - 4) / 24  # t=0 by definition
+    ax.axvline(x=pulse_start_time, color='lime', linestyle='--', linewidth=1.5,
+               label='Pulse start (t=0)', alpha=0.8)
 
-    # Apply very gentle smoothing (3x3 equivalent) to de-emphasize local peaks
-    # while preserving overall structure. This helps the algorithm follow smooth ridges.
-    bitmap_smooth = ndimage.gaussian_filter(bitmap.astype(np.float32), sigma=0.3)
+    # Find the median trace: select the actual pulse closest to the per-sample median
+    median_pulse, selected_pulse_idx = find_median_trace(pulses)
 
-    # Compute Viterbi maximum-likelihood waveform at bitmap column resolution
-    # Using the smoothed bitmap for intensity costs (de-emphasizes local noise peaks)
-    # But extract ridge from original bitmap (true peaks), smoothed to remove noise
-    # Tuning parameters:
-    #   smoothness_weight: penalty for slope changes (0.15)
-    #   acceleration_weight: penalty for curvature changes (0.05)
-    #   ridge_weight: attraction to intensity ridge (50.0 = very strong, enforces smooth ridge-following)
-    ml_path = find_viterbi_ml_waveform_fine(bitmap_smooth, x_scale,
-                                            anchor_column=anchor_column, anchor_value=anchor_value,
-                                            max_jump=150, value_min=value_min, value_max=value_max,
-                                            smoothness_weight=0.15, acceleration_weight=0.05,
-                                            ridge_weight=50.0, bitmap_orig=bitmap)
+    # Convert median pulse to time positions for plotting
+    # Sample index i maps to time t = (i - 4) / 24 seconds
+    sample_indices = np.arange(len(median_pulse))
+    time_positions = (sample_indices - 4) / 24
+    ml_values = median_pulse
 
-    # Extract ordered waveform values and convert columns back to sample space for plotting
-    columns = sorted(ml_path.keys())
-    sample_positions = np.array([c / x_scale for c in columns])
-    ml_values = np.array([ml_path[c] for c in columns])
+    # Convert to column dict format for CSV export compatibility
+    # Each sample index maps to a column in the bitmap
+    ml_path = {int(sample_idx * x_scale): value for sample_idx, value in enumerate(median_pulse)}
 
-    ax.plot(sample_positions, ml_values, color='white', linewidth=2.0, alpha=0.9,
-            label='Maximum likelihood waveform')
+    ax.plot(time_positions, ml_values, color='lime', linewidth=2.0, alpha=0.95,
+            label='Median trace (selected pulse)')
 
-    ax.set_xlabel('Sample number', fontsize=11)
+    ax.set_xlabel('Time (seconds, t=0 at pulse start)', fontsize=11)
     ax.set_ylabel('Waveform value', fontsize=11)
-    ax.set_title(f'Pulse Waveforms Rasterized Display ({len(pulses)} pulses)', fontsize=12)
+
+    # Set x-axis ticks: major at 0.2 sec, minor at 0.1 sec
+    from matplotlib.ticker import MultipleLocator
+    ax.xaxis.set_major_locator(MultipleLocator(0.2))
+    ax.xaxis.set_minor_locator(MultipleLocator(0.1))
+
+    # Extract base filename for title (without path and extension)
+    if csv_filename:
+        title_base = os.path.splitext(os.path.basename(csv_filename))[0]
+    else:
+        title_base = "Pulse Analysis"
+
+    ax.set_title(f'{title_base} ({len(pulses)} pulses)', fontsize=12)
     ax.grid(True, alpha=0.2, color='white', linewidth=0.5)
     ax.legend(loc='upper right', fontsize=10)
 
@@ -689,17 +775,59 @@ def plot_rasterized(pulses, trigger_indices, value_min=0, value_max=254,
     return fig, ml_path
 
 
+def process_chunk(waveform_chunk, csv_file, chunk_start_time, output_file, x_scale, y_scale):
+    """
+    Process a single chunk of waveform data.
+
+    Args:
+        waveform_chunk: waveform data for this chunk
+        csv_file: original input CSV file (for generating output names)
+        chunk_start_time: datetime object for chunk start time
+        output_file: base output PNG file path (or None)
+        x_scale, y_scale: scaling factors
+    """
+    # Extract pulses from this chunk
+    pulses, pulse_start_indices, pulse_info = extract_pulses_minmax(
+        waveform_chunk, window_before=4, window_after=26,
+        min_samples=8, max_samples=29
+    )
+
+    if len(pulses) == 0:
+        print(f"  No pulses found in chunk starting {chunk_start_time.strftime('%H:%M:%S')}")
+        return
+
+    print(f"  Chunk {chunk_start_time.strftime('%H:%M:%S')}: {len(pulses)} pulses")
+
+    # Create and display rasterized display
+    fig, ml_path = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
+                                   value_min=0, value_max=254,
+                                   x_scale=x_scale, y_scale=y_scale)
+
+    # Generate output filenames with chunk time
+    csv_output, png_output = generate_chunk_output_filenames(csv_file, chunk_start_time, output_file)
+
+    # Write ML path to CSV
+    write_ml_path_csv(ml_path, x_scale, csv_output)
+
+    # Save PNG
+    fig.savefig(png_output, dpi=100, bbox_inches='tight')
+    print(f"  Plot saved to {png_output}")
+
+    plt.close(fig)
+
+
 def main():
     print(f"Pulse Oscilloscope Rasterized Display v{VERSION}")
 
     if len(sys.argv) < 2:
-        print("Usage: python pulse_oscilloscope_minmax.py <csv_file> [output_file] [x_scale] [y_scale]")
+        print("Usage: python pulse_oscilloscope_minmax.py <csv_file> [output_file] [x_scale] [y_scale] [-chunk MINUTES]")
         print("  Extracts pulses based on local minima detection")
         print("  Rescales each pulse: min→0, max→254")
         print("  Triggers on rising edge crossing 128 (window: 6 pre-trigger, 24 post-trigger)")
         print("  Displays rasterized waveforms with Viterbi maximum-likelihood overlay")
         print("  x_scale: horizontal scaling factor (default 4)")
         print("  y_scale: vertical scaling factor (default 2)")
+        print("  -chunk MINUTES: divide data into N-minute chunks (filename must contain YYYYMMDD_HHMMSS)")
         sys.exit(1)
 
     csv_file = sys.argv[1]
@@ -707,45 +835,83 @@ def main():
     x_scale = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     y_scale = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 
+    # Check for -chunk argument
+    chunk_minutes = None
+    if '-chunk' in sys.argv:
+        idx = sys.argv.index('-chunk')
+        if idx + 1 < len(sys.argv):
+            chunk_minutes = int(sys.argv[idx + 1])
+
     # Load raw waveform data
     waveform = load_pulse_data(csv_file)
     print(f"Loaded {len(waveform)} samples from {csv_file}")
 
-    # Extract pulses based on local minima
-    # Shifted left by 4 counts: window_before=6, window_after=24
-    pulses, trigger_indices, pulse_info = extract_pulses_minmax(
-        waveform, window_before=6, window_after=24,
-        min_samples=8, max_samples=29
-    )
+    # If chunking is enabled, process by time chunks
+    if chunk_minutes:
+        print(f"Processing in {chunk_minutes}-minute chunks")
 
-    if len(pulses) == 0:
-        print("No valid pulses found!")
-        sys.exit(1)
+        # Parse start datetime from filename
+        start_time = parse_datetime_from_filename(csv_file)
+        if not start_time:
+            print("Error: cannot parse datetime from filename. Expected format: YYYYMMDD_HHMMSS_...")
+            sys.exit(1)
 
-    # Show statistics
-    print(f"Pulse length range: {min(p['pulse_length'] for p in pulse_info)}-{max(p['pulse_length'] for p in pulse_info)} samples")
-    print(f"Original value ranges (min-max) across all pulses:")
-    original_mins = [p['original_min'] for p in pulse_info]
-    original_maxes = [p['original_max'] for p in pulse_info]
-    print(f"  Min values: {min(original_mins):.1f} to {max(original_mins):.1f}")
-    print(f"  Max values: {min(original_maxes):.1f} to {max(original_maxes):.1f}")
+        print(f"Start time from filename: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    print(f"Horizontal resolution: {pulses.shape[1] * x_scale} pixels ({x_scale}x scaling) for {pulses.shape[1]} samples")
-    print(f"Vertical resolution: {350 * y_scale} pixels ({y_scale}x scaling) for value range [0, 254]")
+        # Calculate chunk size in samples (24 sps)
+        samples_per_chunk = chunk_minutes * 60 * 24
+        num_chunks = int(np.ceil(len(waveform) / samples_per_chunk))
 
-    # Create and display rasterized display
-    fig, ml_path = plot_rasterized(pulses, trigger_indices, value_min=0, value_max=254,
-                                   x_scale=x_scale, y_scale=y_scale)
+        print(f"Total {len(waveform)} samples = {num_chunks} chunks of ~{samples_per_chunk} samples")
 
-    # Always generate CSV output from the input CSV filename
-    csv_output = csv_file.rsplit('.', 1)[0] + '_fit.csv'
-    write_ml_path_csv(ml_path, x_scale, csv_output)
+        # Process each chunk
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * samples_per_chunk
+            end_idx = min((chunk_idx + 1) * samples_per_chunk, len(waveform))
 
-    if output_file:
-        fig.savefig(output_file, dpi=100, bbox_inches='tight')
-        print(f"Plot saved to {output_file}")
+            chunk_start_time = start_time + timedelta(minutes=chunk_idx * chunk_minutes)
+            waveform_chunk = waveform[start_idx:end_idx]
+
+            process_chunk(waveform_chunk, csv_file, chunk_start_time, output_file, x_scale, y_scale)
+
     else:
-        plt.show()
+        # Original behavior: process entire file
+        # Extract pulses based on local minima
+        pulses, pulse_start_indices, pulse_info = extract_pulses_minmax(
+            waveform, window_before=4, window_after=26,
+            min_samples=8, max_samples=29
+        )
+
+        if len(pulses) == 0:
+            print("No valid pulses found!")
+            sys.exit(1)
+
+        # Show statistics
+        print(f"Pulse length range: {min(p['pulse_length'] for p in pulse_info)}-{max(p['pulse_length'] for p in pulse_info)} samples")
+        print(f"Original value ranges (min-max) across all pulses:")
+        original_mins = [p['original_min'] for p in pulse_info]
+        original_maxes = [p['original_max'] for p in pulse_info]
+        print(f"  Min values: {min(original_mins):.1f} to {max(original_mins):.1f}")
+        print(f"  Max values: {min(original_maxes):.1f} to {max(original_maxes):.1f}")
+
+        print(f"Horizontal resolution: {pulses.shape[1] * x_scale} pixels ({x_scale}x scaling) for {pulses.shape[1]} samples")
+        print(f"Vertical resolution: {350 * y_scale} pixels ({y_scale}x scaling) for value range [0, 254]")
+        print(f"Time axis: sample 4 = t=0 sec (pulse start), range -0.17 to +1.08 seconds")
+
+        # Create and display rasterized display
+        fig, ml_path = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
+                                       value_min=0, value_max=254,
+                                       x_scale=x_scale, y_scale=y_scale)
+
+        # Always generate CSV output from the input CSV filename
+        csv_output = csv_file.rsplit('.', 1)[0] + '_fit.csv'
+        write_ml_path_csv(ml_path, x_scale, csv_output)
+
+        if output_file:
+            fig.savefig(output_file, dpi=100, bbox_inches='tight')
+            print(f"Plot saved to {output_file}")
+        else:
+            plt.show()
 
 
 if __name__ == '__main__':
