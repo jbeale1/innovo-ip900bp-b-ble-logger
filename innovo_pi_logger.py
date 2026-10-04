@@ -2,7 +2,7 @@
 """
 Innovo iP900BP-B BLE Logger for Raspberry Pi
 Uses Bleak library, with CSV file logging of 1 sps and 24 sps data streams
-J.Beale 1-Oct-2026
+J.Beale 3-Oct-2026
 """
 
 import asyncio
@@ -14,7 +14,7 @@ import argparse
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 
-VERSION = "2.7"
+VERSION = "3.0"
 
 DEVICE_NAME = "iP900BPB"
 
@@ -83,7 +83,13 @@ class OximeterLogger:
         self.packet_count = 0
         self.waveform_sample_count = 0
         self.missing_frames = 0
+        self.missing_packet_frames = 0  # Count frames with <24 waveform packets
         self.signal_acquired = False  # Track if we've received first valid reading
+        self.waveform_packets_since_summary = 0  # Count waveform packets between summaries
+
+        # Buffer for waveform packets in current 1-second frame
+        self.waveform_buffer = []  # List of (value, timestamp) tuples
+        self.waveform_buffer_start_time = None
 
         self.init_csv()
 
@@ -99,9 +105,50 @@ class OximeterLogger:
         # Waveform CSV
         self.waveform_csv_handle = open(self.waveform_csv_file, 'w', newline='')
         self.waveform_csv_writer = csv.writer(self.waveform_csv_handle)
-        self.waveform_csv_writer.writerow(['sample_num', 'waveform_value'])
+        self.waveform_csv_writer.writerow(['sample_num', 'waveform_value', 'interpolated'])
         self.waveform_csv_handle.flush()
         print(f"Waveform CSV initialized: {self.waveform_csv_file}")
+
+    def synthesize_missing_packets(self):
+        """Detect and synthesize missing waveform packets in the buffer"""
+        if len(self.waveform_buffer) >= 24:
+            return self.waveform_buffer  # No packets missing
+
+        if len(self.waveform_buffer) < 2:
+            return self.waveform_buffer  # Can't synthesize with <2 packets
+
+        self.missing_packet_frames += 1
+
+        # Extract values and timestamps
+        values = [v for v, t in self.waveform_buffer]
+        times = [t for v, t in self.waveform_buffer]
+
+        # Detect gaps in timing (a gap ~2x the normal interval indicates a missing packet)
+        expected_interval = (times[-1] - times[0]) / (len(times) - 1)
+
+        # Find the largest gap
+        max_gap_idx = 0
+        max_gap = 0
+        for i in range(len(times) - 1):
+            gap = times[i + 1] - times[i]
+            if gap > max_gap:
+                max_gap = gap
+                max_gap_idx = i
+
+        # Insert synthesized value at the gap
+        if max_gap > expected_interval * 1.5:  # Confirm it's a real gap
+            # Synthesize as average of values before and after the gap
+            synthesized_value = (values[max_gap_idx] + values[max_gap_idx + 1]) / 2.0
+            gap_time = times[max_gap_idx] + expected_interval
+
+            # Insert synthesized packet in the correct position
+            result = self.waveform_buffer[:max_gap_idx + 1]
+            result.append((synthesized_value, gap_time, True))  # True = interpolated
+            result.extend([(v, t, False) for v, t in self.waveform_buffer[max_gap_idx + 1:]])
+
+            return result
+
+        return self.waveform_buffer
 
     def update(self, data):
         """Parse and log measurement packet (summary or waveform)"""
@@ -136,20 +183,62 @@ class OximeterLogger:
             ])
             self.csv_handle.flush()
 
+            # Process buffered waveform packets for this second
+            if self.waveform_buffer:
+                # Detect and synthesize missing packets if needed
+                processed_buffer = self.synthesize_missing_packets()
+
+                # Pad with zeros to enforce exactly 24 waveform values per frame
+                while len(processed_buffer) < 24:
+                    processed_buffer.append((0, None, True))  # 0 value, no time, mark as interpolated
+
+                # Write all waveform packets to CSV
+                for item in processed_buffer:
+                    if len(item) == 3:  # (value, time, is_interpolated)
+                        value, time_val, is_interpolated = item
+                    else:  # (value, time) from original buffer
+                        value, time_val = item
+                        is_interpolated = False
+
+                    self.waveform_sample_count += 1
+                    if is_interpolated:
+                        self.waveform_csv_writer.writerow([
+                            self.waveform_sample_count,
+                            value,
+                            1
+                        ])
+                    else:
+                        self.waveform_csv_writer.writerow([
+                            self.waveform_sample_count,
+                            int(value)
+                        ])
+
+                self.waveform_csv_handle.flush()
+
+            # Record actual waveform packet count for this frame
+            self.waveform_packets_since_summary = len(self.waveform_buffer)
+
+            # Reset buffer for next second
+            self.waveform_buffer = []
+
             self.display()
             return True
 
         # 2-byte waveform packet (24 Hz waveform data)
         elif len(data_bytes) == 2 and data_bytes[0] == 0x01:
             waveform_value = data_bytes[1]
-            self.waveform_sample_count += 1
+            current_time = time.time()
 
-            # Write waveform to CSV
-            self.waveform_csv_writer.writerow([
-                self.waveform_sample_count,
-                waveform_value
-            ])
-            self.waveform_csv_handle.flush()
+            # Initialize buffer start time on first packet
+            if not self.waveform_buffer:
+                self.waveform_buffer_start_time = current_time
+
+            # Add to buffer
+            self.waveform_buffer.append((waveform_value, current_time))
+
+            # Update count (before synthesis, this shows actual received count)
+            self.waveform_packets_since_summary = len(self.waveform_buffer)
+
             return True
 
         return False
@@ -159,7 +248,10 @@ class OximeterLogger:
         sys.stdout.write(f"\r[{self.packet_count:4d}] SpO2: {self.spo2:3}% | "
                         f"Pulse: {self.pulse:3} BPM | "
                         f"Respiration: {self.respiration:2}/min | "
-                        f"PI: {self.perfusion_index:4.1f}% | Bad: {self.missing_frames:3d}     ")
+                        f"PI: {self.perfusion_index:4.1f}% | "
+                        f"pkts: {self.waveform_packets_since_summary:2d} | "
+                        f"miss: {self.missing_packet_frames:2d} | "
+                        f"Bad: {self.missing_frames:3d}     ")
         sys.stdout.flush()
 
     def close(self):
@@ -411,15 +503,18 @@ async def main():
                     await asyncio.sleep(2.0)
                     continue
             else:
-                print("Scanning for Innovo devices...")
+                if not scanning_printed:
+                    print("Scanning for Innovo devices...")
+                    scanning_printed = True
                 device_address = await find_innovo_device(timeout=5.0)
                 if not device_address:
-                    print(f"Error: Could not find {DEVICE_NAME} device. Make sure it's powered on and in range.")
-                    return 1
+                    await asyncio.sleep(2.0)
+                    continue
 
             # Remember the original address for reconnection
             if not original_device_address:
                 original_device_address = device_address
+                scanning_printed = False  # Reset for potential reconnection messages
 
             # Create new CSV files with current timestamp
             csv_filename = get_csv_filename()
@@ -435,16 +530,12 @@ async def main():
                 print(f"Connecting to {device_address}...")
                 async with BleakClient(device_address, timeout=10.0) as client:
                     logger = OximeterLogger(csv_filename, waveform_csv_filename, client=client)
-                    print(f"Connected!")
-                    print("Discovering characteristics...")
 
                     # Find all notify/indicate characteristics
                     for service in client.services:
                         for char in service.characteristics:
                             if "notify" in char.properties or "indicate" in char.properties:
                                 notify_chars.append(str(char.uuid))
-
-                    print(f"Found {len(notify_chars)} notify characteristic(s)")
 
                     # Create notification handler with timeout tracking
                     def notification_handler(sender, data):
@@ -488,13 +579,19 @@ async def main():
                 # Ctrl+C during connection setup
                 exit_requested = True
             except Exception as e:
-                print(f"Connection error: {e}")
-                import traceback
-                traceback.print_exc()
+                # Suppress dbus disconnect errors during clean exit
+                if not exit_requested:
+                    print(f"Connection error: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             finally:
                 if logger:
                     logger.close()
+                    # Print logged minutes
+                    if logger.waveform_sample_count > 0:
+                        minutes_logged = logger.waveform_sample_count / 24.0 / 60.0
+                        print(f"\n\nLogged {minutes_logged:.1f} minutes of data.")
 
             # Wait before attempting reconnection (silent)
             await asyncio.sleep(2.0)
@@ -505,12 +602,14 @@ async def main():
             # Ctrl+C during reconnection scan
             exit_requested = True
         except Exception as e:
-            print(f"Unexpected error: {e}")
-            import traceback
-            traceback.print_exc()
-            await asyncio.sleep(2.0)
+            if not exit_requested:
+                print(f"Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(2.0)
 
-    print("\n\nProgram terminated.")
+    if exit_requested:
+        print("\n\nShutdown complete.")
     return 0
 
 
