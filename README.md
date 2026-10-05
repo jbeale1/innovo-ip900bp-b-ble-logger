@@ -24,8 +24,6 @@ Connecting to ED:9B:47:2E:0F:68...
 Summary CSV initialized: /home/pi/20260930_230330_pulse.csv
 Waveform CSV initialized: /home/pi/20260930_230330_pulse_waveform.csv
 Connected!
-Discovering characteristics...
-Found 4 notify characteristic(s)
 ================================================================================
 Live Measurements (put finger on oximeter, press Ctrl+C to stop)
 ================================================================================
@@ -37,3 +35,5 @@ Logged 684 waveform samples to /home/pi/20260930_230330_pulse_waveform.csv
 ```
 These programs search for a device named "iP900BPB" and if multiple exist, uses the one with the best signal strength.
 Note: this is unofficial code and I have no connection with Innovo, other than having bought a few of these devices.
+
+![Stacked Pulses](docs/20261004_002237_0442.png)
