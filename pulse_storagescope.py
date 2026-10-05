@@ -2,15 +2,17 @@
 """
 Pulse extraction based on local minima detection and min-to-min pulse separation.
 Each pulse is rescaled so its minimum is 0 and maximum is 254.
-Pulse start point is the minimum value of each pulse, aligned at sample index 4 (t=0).
-Displays fixed 6-sample pre-start, 24-sample post-start window for analysis.
+Reference point: midpoint between pulse minimum and maximum (sub-sample precision).
+Displays fixed 5-sample pre-minimum, 30-sample post-minimum window for analysis (36 total = 1.5 seconds).
 Sample rate: 24 sps. BPM range: 50-180 → pulse length: 8-29 samples.
 Median trace extraction: selects the actual pulse closest to per-sample median across all pulses.
 Supports chunking by time duration for long recordings.
-Time axis: sample 4 = t=0 sec (pulse start); range -0.17 to +1.08 seconds.
+Time axis: midpoint between min/max = t=0 sec (pulse reference); extended to 1.5 seconds.
+Display uses linear interpolation with 4x oversampling for smoother curves.
+J.Beale 4-Oct-2026
 """
 
-VERSION = "2.16"
+VERSION = "2.35"
 
 import pandas as pd
 import numpy as np
@@ -18,10 +20,74 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import PowerNorm
 from scipy import signal
 from scipy import ndimage
+from scipy.interpolate import CubicSpline
 import sys
 import os
 import re
 from datetime import datetime, timedelta
+
+
+def find_value_position(pulse, target_value):
+    """
+    Find the fractional sample position where a pulse reaches a target value.
+    Uses linear interpolation between samples.
+
+    Args:
+        pulse: array of pulse values
+        target_value: the value to find
+
+    Returns:
+        fractional_index: position in the pulse array (may be fractional)
+        or None if target_value is not found
+    """
+    # Find the first sample >= target_value
+    indices = np.where(pulse >= target_value)[0]
+
+    if len(indices) == 0:
+        return None
+
+    idx = indices[0]
+
+    if idx == 0:
+        return 0.0
+
+    # Interpolate between pulse[idx-1] and pulse[idx] to find exact position
+    val_before = pulse[idx - 1]
+    val_after = pulse[idx]
+
+    if val_before == val_after:
+        return float(idx)
+
+    # Linear interpolation: fractional position between idx-1 and idx
+    fraction = (target_value - val_before) / (val_after - val_before)
+    return (idx - 1) + fraction
+
+
+def resample_pulse_linear(pulse, upsample_factor=4):
+    """
+    Resample a pulse to higher resolution using linear interpolation.
+
+    Args:
+        pulse: array of pulse values (original sample points)
+        upsample_factor: factor to increase resolution (e.g., 4 = 4x resolution)
+
+    Returns:
+        resampled_pulse: array of values at higher resolution
+        resampled_indices: sample indices in original space for each resampled point
+    """
+    original_indices = np.arange(len(pulse))
+
+    # Generate resampled indices (every 1/upsample_factor in original space)
+    new_length = (len(pulse) - 1) * upsample_factor + 1
+    resampled_indices = np.linspace(0, len(pulse) - 1, new_length)
+
+    # Linear interpolation
+    resampled_pulse = np.interp(resampled_indices, original_indices, pulse)
+
+    # Clamp to valid range [0, 254] (should not be needed for linear, but safe)
+    resampled_pulse = np.clip(resampled_pulse, 0, 254)
+
+    return resampled_pulse, resampled_indices
 
 
 def parse_datetime_from_filename(csv_filename):
@@ -76,7 +142,11 @@ def generate_chunk_output_filenames(csv_file, chunk_start_time, png_file=None):
 def load_pulse_data(csv_file):
     """Load pulse waveform data from CSV."""
     df = pd.read_csv(csv_file)
-    return df['waveform_value'].values
+    # Try multiple possible column names for compatibility
+    for col_name in ['waveform_value', 'value']:
+        if col_name in df.columns:
+            return df[col_name].values
+    raise ValueError(f"No valid waveform column found. Available columns: {df.columns.tolist()}")
 
 
 def smooth_5point_mean(data):
@@ -91,24 +161,25 @@ def find_local_minima(data, order=1):
     return minima_indices
 
 
-def extract_pulses_minmax(waveform, window_before=4, window_after=26,
-                          min_samples=8, max_samples=29):
+def extract_pulses_minmax(waveform, window_before=5, window_after=30,
+                          min_samples=8, max_samples=34):
     """
-    Extract pulses between consecutive minima.
-    Rescale each pulse so min=0, max=254.
-    Pulse start point is the minimum value, aligned at sample index 4 (t=0 seconds).
+    Extract pulses with two complete min/max cycles within a contiguous window.
+    Window: starts 5 samples before the first minimum, contains 36 samples.
+    Validation: only the FIRST min/max must have raw values != 0 and != 254.
+    Rescaling: uses only the FIRST min/max for rescaling.
 
     Args:
         waveform: raw waveform data
-        window_before: samples to capture before pulse start (4, puts minimum at index 4)
-        window_after: samples to capture after pulse start (26, gives 31 total samples)
+        window_before: samples to capture before pulse start (5)
+        window_after: samples to capture after pulse start (30, gives 36 total)
         min_samples: minimum pulse length in samples (8 for 180 bpm at 24 sps)
-        max_samples: maximum pulse length in samples (29 for 50 bpm at 24 sps)
+        max_samples: maximum pulse length in samples (34 for 50 bpm at 24 sps)
 
     Returns:
-        pulses: array of extracted pulses (each rescaled to 0-254 range)
-        pulse_start_indices: pulse start point (minimum) within each extracted pulse
-        pulse_info: list of dicts with metadata (original min/max, pulse length)
+        pulses: array of extracted pulses (each rescaled using first min/max)
+        pulse_start_indices: pulse start point (first minimum) within each extracted pulse
+        pulse_info: list of dicts with metadata (first min/max, second min/max, pulse length)
     """
     # Smooth the data
     smoothed = smooth_5point_mean(waveform)
@@ -125,41 +196,20 @@ def extract_pulses_minmax(waveform, window_before=4, window_after=26,
     pulse_info = []
     discarded_count = 0
 
-    # Extract pulses between consecutive minima
+    # Extract pulses using the first minimum as reference
     for i in range(len(minima_indices) - 1):
-        start_idx = minima_indices[i]
-        end_idx = minima_indices[i + 1]
-        pulse_length = end_idx - start_idx
+        first_min_idx = minima_indices[i]
+        next_min_idx = minima_indices[i + 1]
+        pulse_length = next_min_idx - first_min_idx
 
         # Check if pulse length is in valid range
         if pulse_length < min_samples or pulse_length > max_samples:
             discarded_count += 1
             continue
 
-        # Extract pulse from raw (unsmoothed) waveform
-        pulse = waveform[start_idx:end_idx + 1]
-
-        # Find min and max in this pulse
-        pulse_min = np.min(pulse)
-        pulse_max = np.max(pulse)
-
-        # Discard flat pulses
-        if pulse_min == pulse_max:
-            discarded_count += 1
-            continue
-
-        # Rescale pulse: min → 0, max → 254
-        pulse_rescaled = (pulse - pulse_min) / (pulse_max - pulse_min) * 254.0
-
-        # Find the minimum point (pulse start) in the rescaled pulse
-        pulse_start_idx = np.argmin(pulse_rescaled)
-
-        # Map back to original waveform coordinate
-        pulse_start_in_waveform = start_idx + pulse_start_idx
-
-        # Extract fixed window around pulse start: window_before before, window_after after
-        window_start = pulse_start_in_waveform - window_before
-        window_end = pulse_start_in_waveform + window_after + 1
+        # Extract fixed window: window_before before first minimum, window_after after
+        window_start = first_min_idx - window_before
+        window_end = first_min_idx + window_after + 1
 
         # Check if window is valid
         if window_start < 0 or window_end > len(waveform):
@@ -169,20 +219,83 @@ def extract_pulses_minmax(waveform, window_before=4, window_after=26,
         # Extract window from raw waveform
         window = waveform[window_start:window_end]
 
-        # Rescale this window the same way (using the pulse's min/max)
-        window_rescaled = (window - pulse_min) / (pulse_max - pulse_min) * 254.0
+        # Find FIRST minimum and maximum within the window
+        # First minimum should be at index window_before
+        first_min_in_window = window_before
+        first_min_value = window[first_min_in_window]
 
-        # Pulse start point is at window_before in the extracted window
+        # Find first maximum: search after first minimum
+        first_max_search = window[first_min_in_window:first_min_in_window + pulse_length]
+        if len(first_max_search) == 0:
+            discarded_count += 1
+            continue
+        first_max_in_search = np.argmax(first_max_search)
+        first_max_in_window = first_min_in_window + first_max_in_search
+        first_max_value = window[first_max_in_window]
+
+        # VALIDATE: First min should not be 0, first max should not be 254 (raw values)
+        # Also reject if first_min == first_max (would cause divide by zero in rescaling)
+        if first_min_value == 0 or first_max_value == 254 or first_min_value == first_max_value:
+            discarded_count += 1
+            continue
+
+        # Find SECOND minimum and maximum within the window
+        # Second minimum should be near first_min_in_window + pulse_length
+        second_min_search_start = first_max_in_window + 1
+        if second_min_search_start >= len(window):
+            discarded_count += 1
+            continue
+
+        second_min_search = window[second_min_search_start:]
+        if len(second_min_search) == 0:
+            discarded_count += 1
+            continue
+        second_min_in_search = np.argmin(second_min_search)
+        second_min_in_window = second_min_search_start + second_min_in_search
+        second_min_value = window[second_min_in_window]
+
+        # Find second maximum: after second min (in the second pulse's rising edge)
+        second_max_search = window[second_min_in_window + 1:]
+        if len(second_max_search) > 0:
+            second_max_in_search = np.argmax(second_max_search)
+            second_max_in_window = second_min_in_window + 1 + second_max_in_search
+            second_max_value = window[second_max_in_window]
+        else:
+            # If no data after second min, estimate using pulse_length spacing
+            # The second max should occur roughly halfway to the next minimum
+            estimated_next_min = second_min_in_window + pulse_length
+            second_max_in_window = (second_min_in_window + min(estimated_next_min, len(window) - 1)) // 2
+            second_max_value = window[second_max_in_window]
+
+        # Rescale window using ONLY the FIRST min/max
+        window_rescaled = (window - first_min_value) / (first_max_value - first_min_value) * 254.0
+
+        # Pulse start point is at window_before in the extracted window (the first minimum)
         pulse_start_in_window = window_before
 
         pulses.append(window_rescaled)
         pulse_start_indices.append(pulse_start_in_window)
 
+        # Calculate midpoint indices for both min/max pairs
+        # Use average of min/max indices rather than searching for value
+        # This is more robust and avoids issues with multiple occurrences of the same value
+        first_midpoint_idx = (first_min_in_window + first_max_in_window) / 2.0
+        second_midpoint_idx = (second_min_in_window + second_max_in_window) / 2.0
+
         pulse_info.append({
-            'original_min': float(pulse_min),
-            'original_max': float(pulse_max),
+            'first_min': float(first_min_value),
+            'first_max': float(first_max_value),
+            'first_min_idx': first_min_in_window,
+            'first_max_idx': first_max_in_window,
+            'first_midpoint_idx': first_midpoint_idx,
+            'second_min': float(second_min_value),
+            'second_max': float(second_max_value),
+            'second_min_idx': second_min_in_window,
+            'second_max_idx': second_max_in_window,
+            'second_midpoint_idx': second_midpoint_idx,
             'pulse_length': pulse_length
         })
+
 
     print(f"Extracted {len(pulses)} valid pulses")
     print(f"Discarded {discarded_count} pulses (length out of range or invalid window)")
@@ -635,21 +748,23 @@ def find_viterbi_ml_waveform_fine(bitmap, x_scale, anchor_column, anchor_value, 
     return path
 
 
-def write_ml_path_csv(ml_path, x_scale, output_file):
+def write_ml_path_csv(ml_path, x_scale, output_file, midpoint_fractional_idx=4.0):
     """
     Write the median trace to a CSV file with time resolution.
-    Time is calculated as: t = (sample_idx - 4) / 24 seconds, where sample 4 = t=0 (pulse start).
+    Time is calculated as: t = (sample_idx - midpoint_fractional_idx) / 24 seconds,
+    where midpoint_fractional_idx = t=0 (pulse reference point, typically the midpoint between min/max).
 
     Args:
         ml_path: dict {column_idx: value} from median trace extraction
         x_scale: horizontal scaling factor (to convert columns back to samples)
         output_file: path to output CSV file
+        midpoint_fractional_idx: reference point in original sample space (default 4.0 for backward compatibility)
     """
     # Convert bitmap columns to sample positions and sort
     columns = sorted(ml_path.keys())
     sample_positions = [c / x_scale for c in columns]
-    # Convert samples to time: t = (sample - 4) / 24 seconds
-    time_positions = [(s - 4) / 24 for s in sample_positions]
+    # Convert samples to time: t = (sample - midpoint_fractional_idx) / 24 seconds
+    time_positions = [(s - midpoint_fractional_idx) / 24 for s in sample_positions]
     values = [ml_path[c] for c in columns]
 
     # Write CSV with header
@@ -661,12 +776,14 @@ def write_ml_path_csv(ml_path, x_scale, output_file):
     print(f"Median trace written to {output_file}")
 
 
-def find_median_trace(pulses):
+def find_median_trace(pulses, exclude_last=False):
     """
     Find the median trace by selecting the actual pulse closest to the per-sample median.
 
     Args:
         pulses: array of pulse waveforms (n_pulses × n_samples)
+        exclude_last: if True, exclude the last pulse from being selected as median trace
+                     (useful when the last pulse is at chunk boundary and may lack following pulse data)
 
     Returns:
         (median_pulse, selected_pulse_idx): the pulse from the dataset closest to the
@@ -677,7 +794,12 @@ def find_median_trace(pulses):
 
     # For each pulse, compute the total Euclidean distance from the median trace
     distances = []
-    for pulse in pulses:
+    max_idx = len(pulses) - 1 if exclude_last else len(pulses)
+
+    for i, pulse in enumerate(pulses):
+        if i >= max_idx:
+            distances.append(float('inf'))  # Exclude this pulse
+            continue
         # Sum of squared distances at each sample point (Euclidean metric)
         euclidean_distance = np.sqrt(np.sum((pulse - median_trace) ** 2))
         distances.append(euclidean_distance)
@@ -686,30 +808,151 @@ def find_median_trace(pulses):
     closest_pulse_idx = np.argmin(distances)
     median_pulse = pulses[closest_pulse_idx]
 
+    if exclude_last and closest_pulse_idx == len(pulses) - 1:
+        print(f"WARNING: Last pulse excluded from median selection (at chunk boundary)")
+
     print(f"Selected pulse {closest_pulse_idx} as median trace (distance: {distances[closest_pulse_idx]:.2f})")
     print(f"Median trace values: min={np.min(median_trace):.1f}, max={np.max(median_trace):.1f}")
 
     return median_pulse, closest_pulse_idx
 
 
-def plot_rasterized(pulses, pulse_start_indices, csv_filename=None, value_min=0, value_max=254,
-                    x_scale=4, y_scale=2):
-    """Display rasterized waveforms as intensity map with time axis (sample 4 = t=0 sec)."""
+def find_second_extrema(pulse, first_min_idx=None, min_threshold=50, min_distance=12):
+    """
+    Find the 2nd minimum and 2nd maximum in a pulse waveform.
+
+    The 2nd minimum is the start of the following pulse, found by:
+    1. Searching at least min_distance samples ahead from the first minimum
+    2. Finding a point that is no more than min_threshold counts above the first minimum
+    3. Confirming it's a local minimum (value increases after it)
+
+    This ignores dicrotic notches and post-peak ripples.
+
+    Args:
+        pulse: array of pulse values (rescaled 0-254)
+        first_min_idx: index of the first minimum (if None, finds it)
+        min_threshold: maximum height above first minimum for a point to be considered 2nd min (default 50)
+        min_distance: minimum samples to search ahead before looking for 2nd min (default 12, ~0.5 sec at 24 sps)
+
+    Returns:
+        (second_min_idx, second_max_idx, second_min_value, second_max_value) or (None, None, None, None) if not found
+    """
+    if len(pulse) < min_distance + 2:
+        return None, None, None, None
+
+    # Find first minimum if not provided
+    if first_min_idx is None:
+        first_min_idx = np.argmin(pulse)
+
+    first_min_value = pulse[first_min_idx]
+
+    # Search for 2nd minimum, but start at least min_distance samples ahead
+    # This avoids finding immediate post-minimum ripples or dicrotic notches
+    second_min_idx = None
+    search_start = first_min_idx + min_distance
+
+    # First, look for a point that meets the threshold
+    for i in range(search_start, len(pulse)):
+        if pulse[i] <= (first_min_value + min_threshold):
+            # Check if this is a local minimum or valley (values increase after it)
+            if i < len(pulse) - 1 and pulse[i + 1] > pulse[i]:
+                second_min_idx = i
+                break
+
+    # If not found within threshold, find the actual local minimum in the search region
+    # This handles cases where the pulse descent hasn't completed by the window end
+    if second_min_idx is None and search_start < len(pulse):
+        remaining_pulse = pulse[search_start:]
+        local_min_offset = np.argmin(remaining_pulse)
+        candidate_idx = search_start + local_min_offset
+
+        # Accept the local minimum if it's reasonably a valley point
+        # Check: is it lower than at least one neighbor?
+        is_valley = False
+
+        if candidate_idx < len(pulse) - 1:
+            # Not at end: skip over any flat region (adjacent equal-valued points at minimum)
+            last_min_idx = candidate_idx
+            while last_min_idx < len(pulse) - 1 and pulse[last_min_idx + 1] == pulse[candidate_idx]:
+                last_min_idx += 1
+
+            # Check if value increases after the flat region
+            if last_min_idx < len(pulse) - 1 and pulse[last_min_idx + 1] > pulse[candidate_idx]:
+                is_valley = True
+        elif candidate_idx > search_start:
+            # At or near end: check if value decreases before it
+            if pulse[candidate_idx - 1] > pulse[candidate_idx]:
+                is_valley = True
+
+        if is_valley:
+            second_min_idx = candidate_idx
+
+    if second_min_idx is None:
+        return None, None, None, None
+
+    second_min_value = pulse[second_min_idx]
+
+    # Find maximum after the 2nd minimum
+    if second_min_idx < len(pulse) - 1:
+        remaining_pulse = pulse[second_min_idx + 1:]
+        second_max_offset = np.argmax(remaining_pulse)
+        second_max_idx = second_min_idx + 1 + second_max_offset
+        second_max_value = pulse[second_max_idx]
+    else:
+        return None, None, None, None
+
+    return second_min_idx, second_max_idx, second_min_value, second_max_value
+
+
+def plot_rasterized(pulses, pulse_start_indices, csv_filename=None, pulse_info=None, value_min=0, value_max=254,
+                    x_scale=4, y_scale=2, plot_title=None, show_colorbar=True):
+    """
+    Display rasterized waveforms as intensity map with time axis.
+    Resamples pulses to 4x resolution for display, using midpoint between min/max as t=0 reference.
+    """
     fig, ax = plt.subplots(figsize=(14, 8))
 
-    # Draw rasterized oscilloscope display
-    bitmap = draw_rasterized_oscilloscope(pulses, pulse_start_indices, value_min, value_max,
+    # Resample all pulses to 4x resolution for smoother display
+    upsample_factor = 4
+    pulses_resampled = []
+    midpoint_positions_resampled = []
+
+    for i, pulse in enumerate(pulses):
+        resampled_pulse, resampled_indices = resample_pulse_linear(pulse, upsample_factor)
+        pulses_resampled.append(resampled_pulse)
+
+        # Find first midpoint position in resampled pulse (use first midpoint as reference)
+        if pulse_info and i < len(pulse_info):
+            # In new structure, use first_midpoint_idx which is the reference point
+            original_midpoint = pulse_info[i]['first_midpoint_idx']
+            resampled_midpoint = original_midpoint * upsample_factor
+            midpoint_positions_resampled.append(resampled_midpoint)
+        else:
+            # Fallback: estimate from resampled pulse
+            midpoint_positions_resampled.append(len(resampled_pulse) / 2)
+
+    pulses_resampled = np.array(pulses_resampled)
+
+    # Compute average midpoint position for reference
+    avg_midpoint_position = np.mean(midpoint_positions_resampled)
+
+    # Scale pulse_start_indices to resampled space (not needed for display, but kept for compatibility)
+    pulse_start_indices_resampled = pulse_start_indices * upsample_factor
+
+    # Draw rasterized oscilloscope display using resampled pulses
+    bitmap = draw_rasterized_oscilloscope(pulses_resampled, pulse_start_indices_resampled, value_min, value_max,
                                           x_scale, y_scale)
 
     # Display bitmap with greyscale intensity mapping (15% to 75% grey)
     cmap = plt.cm.gray.copy()
     cmap.set_under('black')
 
-    n_samples = pulses.shape[1]
-    # Convert sample indices to time (sample 4 = t=0 seconds, sample rate = 24 sps)
-    # Time for each sample: t = (sample_idx - 4) / 24
-    time_min = (0 - 4) / 24  # -0.167 seconds
-    time_max = (n_samples - 1 - 4) / 24  # 1.083 seconds
+    n_samples_resampled = pulses_resampled.shape[1]
+    # Convert resampled sample indices to time
+    # Resampled sample rate = 24 * 4 = 96 sps
+    # Time for each resampled sample: t = (resampled_sample_idx - avg_midpoint_position) / 96
+    time_min = (0 - avg_midpoint_position) / 96
+    time_max = (n_samples_resampled - 1 - avg_midpoint_position) / 96
 
     # Map intensity range to greyscale: 0.15 (15% grey) to 0.75 (75% grey)
     im = ax.imshow(bitmap[::-1, :], aspect='auto', cmap=cmap,
@@ -728,20 +971,26 @@ def plot_rasterized(pulses, pulse_start_indices, csv_filename=None, value_min=0,
     # Debug: print anchor point info
     print(f"Peak detected at sample {anchor_sample:.2f}, value {anchor_value:.1f}")
 
-    # Draw vertical line at pulse start (sample 4 = t=0 seconds)
-    pulse_start_sample = 4
-    pulse_start_time = (pulse_start_sample - 4) / 24  # t=0 by definition
-    ax.axvline(x=pulse_start_time, color='lime', linestyle='--', linewidth=1.5,
-               label='Pulse start (t=0)', alpha=0.8)
-
     # Find the median trace: select the actual pulse closest to the per-sample median
-    median_pulse, selected_pulse_idx = find_median_trace(pulses)
+    # This is done on the original (non-resampled) pulses for accurate distance calculation
+    # Exclude the last pulse to ensure we can find the following pulse's minimum if needed
+    median_pulse, selected_pulse_idx = find_median_trace(pulses, exclude_last=True)
 
-    # Convert median pulse to time positions for plotting
-    # Sample index i maps to time t = (i - 4) / 24 seconds
-    sample_indices = np.arange(len(median_pulse))
-    time_positions = (sample_indices - 4) / 24
-    ml_values = median_pulse
+    # Resample the median pulse to 4x resolution for display
+    median_pulse_resampled, _ = resample_pulse_linear(median_pulse, upsample_factor=4)
+
+    # Get the first midpoint position of the selected pulse for proper time alignment
+    # The first midpoint is the reference point (t=0 in the time axis)
+    if pulse_info and selected_pulse_idx < len(pulse_info):
+        median_midpoint = pulse_info[selected_pulse_idx]['first_midpoint_idx'] * 4
+    else:
+        median_midpoint = avg_midpoint_position
+
+    # Convert resampled median pulse to time positions for plotting
+    # Resampled sample index i maps to time t = (i - median_midpoint) / 96 seconds
+    sample_indices_resampled = np.arange(len(median_pulse_resampled))
+    time_positions = (sample_indices_resampled - median_midpoint) / 96
+    ml_values = median_pulse_resampled
 
     # Convert to column dict format for CSV export compatibility
     # Each sample index maps to a column in the bitmap
@@ -750,29 +999,72 @@ def plot_rasterized(pulses, pulse_start_indices, csv_filename=None, value_min=0,
     ax.plot(time_positions, ml_values, color='lime', linewidth=2.0, alpha=0.95,
             label='Median trace (selected pulse)')
 
+    # Draw two vertical dotted lines at the midpoints between min/max pairs
+    # Both midpoint indices are in the extracted window coordinate system
+
+    first_midpoint_idx = pulse_info[selected_pulse_idx]['first_midpoint_idx']
+    second_midpoint_idx = pulse_info[selected_pulse_idx]['second_midpoint_idx']
+
+    # Convert midpoint indices to time coordinates
+    # Time = (sample_index - reference_point) / 24 seconds
+    # Reference point is the first midpoint (t=0), so we shift both relative to it
+    first_midpoint_time = 0.0  # By definition, first midpoint is at t=0
+    second_midpoint_time = (second_midpoint_idx - first_midpoint_idx) / 24.0
+
+    # Draw first vertical line at first midpoint (already exists at t=0, but draw with label)
+    ax.axvline(x=first_midpoint_time, color='lime', linestyle='--', linewidth=1.5,
+               alpha=0.8, label='1st midpoint (t=0)')
+
+    # Draw second vertical line at second midpoint
+    ax.axvline(x=second_midpoint_time, color='lime', linestyle=':', linewidth=2.0,
+               alpha=0.9, label='2nd midpoint')
+
+    # Calculate BPM from the time between the two midpoints
+    time_between_midpoints = second_midpoint_time  # Since first is at 0
+    if time_between_midpoints > 0:
+        bpm = 60.0 / time_between_midpoints
+        # Display BPM on the plot at top-center to avoid obscuring data or legend
+        ax.text(0.5, 0.97, f'Heart Rate: {bpm:.1f} BPM',
+               transform=ax.transAxes, fontsize=11, verticalalignment='top',
+               horizontalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        print(f"Time between midpoints: {time_between_midpoints:.3f} seconds, Heart Rate: {bpm:.1f} BPM")
+
     ax.set_xlabel('Time (seconds, t=0 at pulse start)', fontsize=11)
     ax.set_ylabel('Waveform value', fontsize=11)
+
+    # Ensure axis limits exactly match the imshow extent (no empty space)
+    ax.set_xlim(time_min, time_max)
+    ax.set_ylim(value_min, value_max)
 
     # Set x-axis ticks: major at 0.2 sec, minor at 0.1 sec
     from matplotlib.ticker import MultipleLocator
     ax.xaxis.set_major_locator(MultipleLocator(0.2))
     ax.xaxis.set_minor_locator(MultipleLocator(0.1))
 
-    # Extract base filename for title (without path and extension)
-    if csv_filename:
+    # Set title from provided plot_title or construct from filename
+    if plot_title:
+        title_text = f'{plot_title} ({len(pulses)} pulses)'
+    elif csv_filename:
         title_base = os.path.splitext(os.path.basename(csv_filename))[0]
+        title_text = f'{title_base} ({len(pulses)} pulses)'
     else:
-        title_base = "Pulse Analysis"
+        title_text = f'Pulse Analysis ({len(pulses)} pulses)'
 
-    ax.set_title(f'{title_base} ({len(pulses)} pulses)', fontsize=12)
+    ax.set_title(title_text, fontsize=12)
     ax.grid(True, alpha=0.2, color='white', linewidth=0.5)
     ax.legend(loc='upper right', fontsize=10)
 
-    # Add colorbar
-    cbar = plt.colorbar(im, ax=ax, label='Accumulated intensity')
+    # Add colorbar only if requested
+    if show_colorbar:
+        cbar = plt.colorbar(im, ax=ax, label='Accumulated intensity')
 
     plt.tight_layout()
-    return fig, ml_path
+
+    # Add version number in bottom-right corner (AFTER tight_layout to avoid clipping)
+    ax.text(0.99, 0.01, f'v{VERSION}',
+           transform=ax.transAxes, fontsize=8, verticalalignment='bottom',
+           horizontalalignment='right', color='gray', alpha=0.6)
+    return fig, ml_path, selected_pulse_idx
 
 
 def process_chunk(waveform_chunk, csv_file, chunk_start_time, output_file, x_scale, y_scale):
@@ -788,8 +1080,8 @@ def process_chunk(waveform_chunk, csv_file, chunk_start_time, output_file, x_sca
     """
     # Extract pulses from this chunk
     pulses, pulse_start_indices, pulse_info = extract_pulses_minmax(
-        waveform_chunk, window_before=4, window_after=26,
-        min_samples=8, max_samples=29
+        waveform_chunk, window_before=5, window_after=30,
+        min_samples=8, max_samples=34
     )
 
     if len(pulses) == 0:
@@ -798,16 +1090,36 @@ def process_chunk(waveform_chunk, csv_file, chunk_start_time, output_file, x_sca
 
     print(f"  Chunk {chunk_start_time.strftime('%H:%M:%S')}: {len(pulses)} pulses")
 
-    # Create and display rasterized display
-    fig, ml_path = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
-                                   value_min=0, value_max=254,
-                                   x_scale=x_scale, y_scale=y_scale)
+    # Construct plot title from CSV filename date and chunk start time
+    # CSV filename format: YYYYMMDD_HHMMSS_... → extract YYYYMMDD
+    plot_title = None
+    csv_basename = os.path.basename(csv_file)
+    if '_' in csv_basename:
+        date_str = csv_basename.split('_')[0]  # e.g., "20261004"
+        if len(date_str) == 8 and date_str.isdigit():
+            try:
+                # Parse date as YYYYMMDD
+                date_obj = datetime.strptime(date_str, '%Y%m%d')
+                # Format as YYYY-MM-DD and add chunk time as HH:MM
+                plot_title = f"{date_obj.strftime('%Y-%m-%d')}  {chunk_start_time.strftime('%H:%M')}"
+            except ValueError:
+                pass  # Fall back to default title if parsing fails
+
+    # Create and display rasterized display (without colorbar for cleaner chunked output)
+    fig, ml_path, selected_pulse_idx = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
+                                                       pulse_info=pulse_info,
+                                                       value_min=0, value_max=254,
+                                                       x_scale=x_scale, y_scale=y_scale,
+                                                       plot_title=plot_title, show_colorbar=False)
 
     # Generate output filenames with chunk time
     csv_output, png_output = generate_chunk_output_filenames(csv_file, chunk_start_time, output_file)
 
+    # Get the first midpoint reference from the selected pulse for CSV time axis
+    midpoint_idx = pulse_info[selected_pulse_idx]['first_midpoint_idx'] if pulse_info else 4.0
+
     # Write ML path to CSV
-    write_ml_path_csv(ml_path, x_scale, csv_output)
+    write_ml_path_csv(ml_path, x_scale, csv_output, midpoint_fractional_idx=midpoint_idx)
 
     # Save PNG
     fig.savefig(png_output, dpi=100, bbox_inches='tight')
@@ -876,10 +1188,13 @@ def main():
 
     else:
         # Original behavior: process entire file
+        # Parse start datetime from filename for title formatting
+        start_time = parse_datetime_from_filename(csv_file)
+
         # Extract pulses based on local minima
         pulses, pulse_start_indices, pulse_info = extract_pulses_minmax(
-            waveform, window_before=4, window_after=26,
-            min_samples=8, max_samples=29
+            waveform, window_before=5, window_after=30,
+            min_samples=8, max_samples=34
         )
 
         if len(pulses) == 0:
@@ -889,23 +1204,43 @@ def main():
         # Show statistics
         print(f"Pulse length range: {min(p['pulse_length'] for p in pulse_info)}-{max(p['pulse_length'] for p in pulse_info)} samples")
         print(f"Original value ranges (min-max) across all pulses:")
-        original_mins = [p['original_min'] for p in pulse_info]
-        original_maxes = [p['original_max'] for p in pulse_info]
+        original_mins = [p['first_min'] for p in pulse_info]
+        original_maxes = [p['first_max'] for p in pulse_info]
         print(f"  Min values: {min(original_mins):.1f} to {max(original_mins):.1f}")
         print(f"  Max values: {min(original_maxes):.1f} to {max(original_maxes):.1f}")
 
         print(f"Horizontal resolution: {pulses.shape[1] * x_scale} pixels ({x_scale}x scaling) for {pulses.shape[1]} samples")
         print(f"Vertical resolution: {350 * y_scale} pixels ({y_scale}x scaling) for value range [0, 254]")
-        print(f"Time axis: sample 4 = t=0 sec (pulse start), range -0.17 to +1.08 seconds")
+        print(f"Time axis: midpoint between min/max = t=0 sec (pulse reference), range -0.17 to +1.08 seconds")
+
+        # Construct plot title from CSV filename date and start time
+        plot_title = None
+        csv_basename = os.path.basename(csv_file)
+        if '_' in csv_basename and start_time:
+            date_str = csv_basename.split('_')[0]  # e.g., "20261004"
+            if len(date_str) == 8 and date_str.isdigit():
+                try:
+                    # Parse date as YYYYMMDD
+                    date_obj = datetime.strptime(date_str, '%Y%m%d')
+                    # Format as YYYY-MM-DD and add start time as HH:MM
+                    plot_title = f"{date_obj.strftime('%Y-%m-%d')}  {start_time.strftime('%H:%M')}"
+                except ValueError:
+                    pass  # Fall back to default title if parsing fails
 
         # Create and display rasterized display
-        fig, ml_path = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
-                                       value_min=0, value_max=254,
-                                       x_scale=x_scale, y_scale=y_scale)
+        fig, ml_path, selected_pulse_idx = plot_rasterized(pulses, pulse_start_indices, csv_filename=csv_file,
+                                                           pulse_info=pulse_info,
+                                                           value_min=0, value_max=254,
+                                                           x_scale=x_scale, y_scale=y_scale,
+                                                           plot_title=plot_title)
 
         # Always generate CSV output from the input CSV filename
         csv_output = csv_file.rsplit('.', 1)[0] + '_fit.csv'
-        write_ml_path_csv(ml_path, x_scale, csv_output)
+
+        # Get the midpoint reference from the selected pulse for CSV time axis
+        midpoint_idx = pulse_info[selected_pulse_idx]['first_midpoint_idx'] if pulse_info else 4.0
+
+        write_ml_path_csv(ml_path, x_scale, csv_output, midpoint_fractional_idx=midpoint_idx)
 
         if output_file:
             fig.savefig(output_file, dpi=100, bbox_inches='tight')
